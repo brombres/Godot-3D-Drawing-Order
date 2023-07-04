@@ -1,0 +1,521 @@
+From 0e50ba8652d6365a9dabe1c81a95cdbe1b7e098b Mon Sep 17 00:00:00 2001
+From: Brom Bresenham <brom.bresenham@runegate.com>
+Date: Sat, 10 Jun 2023 19:14:17 -0600
+Subject: [Node3D] Now has .drawing_order; lower numbers draw first
+
+- When VisualInstance3D nodes are sorted into drawing order, they are sorted by:
+  1. Priority
+  2. Effective drawing order
+  3. Depth
+- Effective drawing order is a node's drawing order + its parent's effective drawing order.
+- Thus intangible Node3D (etc.) parents can be used to control drawing order for their children;
+- Material > Transparency > No Depth Test should be set for nodes using this approach.
+---
+ doc/classes/Node3D.xml                        |  9 +++
+ doc/classes/VisualInstance3D.xml              |  3 +
+ drivers/gles3/rasterizer_scene_gles3.h        |  9 ++-
+ scene/3d/node_3d.cpp                          | 71 +++++++++++++++----
+ scene/3d/node_3d.h                            |  6 ++
+ scene/3d/visual_instance_3d.cpp               |  8 +++
+ scene/scene_string_names.cpp                  |  1 +
+ scene/scene_string_names.h                    |  1 +
+ .../rendering/dummy/rasterizer_scene_dummy.h  |  1 +
+ .../rendering/renderer_geometry_instance.cpp  |  4 ++
+ .../rendering/renderer_geometry_instance.h    |  3 +
+ .../render_forward_clustered.h                |  9 ++-
+ .../forward_mobile/render_forward_mobile.h    |  9 ++-
+ servers/rendering/renderer_scene_cull.cpp     | 14 ++++
+ servers/rendering/renderer_scene_cull.h       |  2 +
+ servers/rendering/rendering_method.h          |  1 +
+ servers/rendering/rendering_server_default.h  |  1 +
+ servers/rendering_server.cpp                  |  1 +
+ servers/rendering_server.h                    |  1 +
+ 19 files changed, 136 insertions(+), 18 deletions(-)
+
+diff --git a/doc/classes/Node3D.xml b/doc/classes/Node3D.xml
+index 8247911a34..2513236188 100644
+--- a/doc/classes/Node3D.xml
++++ b/doc/classes/Node3D.xml
+@@ -39,6 +39,12 @@
+ 				Forces the transform to update. Transform changes in physics are not instant for performance reasons. Transforms are accumulated and then set. Use this if you need an up-to-date transform when doing physics operations.
+ 			</description>
+ 		</method>
++		<method name="get_effective_drawing_order" qualifiers="const">
++			<return type="int" />
++			<description>
++				Returns this node's [member drawing_order] or, if zero, its parent's [method get_effective_drawing_order].
++			</description>
++		</method>
+ 		<method name="get_gizmos" qualifiers="const">
+ 			<return type="Node3DGizmo[]" />
+ 			<description>
+@@ -309,6 +315,9 @@
+ 			[b]Note:[/b] Mixed negative scales in 3D are not decomposable from the transformation matrix. Due to the way scale is represented with transformation matrices in Godot, the scale values will either be all positive or all negative.
+ 			[b]Note:[/b] Not all nodes are visually scaled by the [member scale] property. For example, [Light3D]s are not visually affected by [member scale].
+ 		</member>
++		<member name="drawing_order" type="int" setter="set_drawing_order" getter="get_drawing_order" default="0">
++			Nodes with a lower drawing order will be drawn before those with a higher drawing order. This may not make a visible difference if depth testing is in use; set the material's Transparency > No Depth Test option to disable depth testing. Nodes with a drawing order of 0 will be drawn using their parent's drawing order.
++		</member>
+ 		<member name="top_level" type="bool" setter="set_as_top_level" getter="is_set_as_top_level" default="false">
+ 			If [code]true[/code], the node will not inherit its transformations from its parent. Node transformations are only in global space.
+ 		</member>
+diff --git a/doc/classes/VisualInstance3D.xml b/doc/classes/VisualInstance3D.xml
+index 46454d4ecc..cbb1d817ef 100644
+--- a/doc/classes/VisualInstance3D.xml
++++ b/doc/classes/VisualInstance3D.xml
+@@ -63,6 +63,9 @@
+ 			To adjust [member layers] more easily using a script, use [method get_layer_mask_value] and [method set_layer_mask_value].
+ 			[b]Note:[/b] [VoxelGI], SDFGI and [LightmapGI] will always take all layers into account to determine what contributes to global illumination. If this is an issue, set [member GeometryInstance3D.gi_mode] to [constant GeometryInstance3D.GI_MODE_DISABLED] for meshes and [member Light3D.light_bake_mode] to [constant Light3D.BAKE_DISABLED] for lights to exclude them from global illumination.
+ 		</member>
++		<member name="drawing_order" type="int" setter="set_drawing_order" getter="get_drawing_order" default="0">
++			Nodes with a lower drawing order will be drawn before those with a higher drawing order. This may not make a visible difference if depth testing is in use; set the material's Transparency > No Depth Test option to disable depth testing.
++		</member>
+ 		<member name="sorting_offset" type="float" setter="set_sorting_offset" getter="get_sorting_offset" default="0.0">
+ 			The amount by which the depth of this [VisualInstance3D] will be adjusted when sorting by depth. Uses the same units as the engine (which are typically meters). Adjusting it to a higher value will make the [VisualInstance3D] reliably draw on top of other [VisualInstance3D]s that are otherwise positioned at the same spot. To ensure it always draws on top of other objects around it (not positioned at the same spot), set the value to be greater than the distance between this [VisualInstance3D] and the other nearby [VisualInstance3D]s.
+ 		</member>
+diff --git a/drivers/gles3/rasterizer_scene_gles3.h b/drivers/gles3/rasterizer_scene_gles3.h
+index 9709d6be2a..f46225ce10 100644
+--- a/drivers/gles3/rasterizer_scene_gles3.h
++++ b/drivers/gles3/rasterizer_scene_gles3.h
+@@ -445,7 +445,14 @@ private:
+ 
+ 		struct SortByReverseDepthAndPriority {
+ 			_FORCE_INLINE_ bool operator()(const GeometryInstanceSurface *A, const GeometryInstanceSurface *B) const {
+-				return (A->sort.priority == B->sort.priority) ? (A->owner->depth > B->owner->depth) : (A->sort.priority < B->sort.priority);
++				return (A->sort.priority == B->sort.priority)
++					?
++						(
++							(A->owner->drawing_order == B->owner->drawing_order)
++							? (A->owner->depth > B->owner->depth)
++							: (A->owner->drawing_order < B->owner->drawing_order)
++						)
++					: (A->sort.priority < B->sort.priority);
+ 			}
+ 		};
+ 
+diff --git a/scene/3d/node_3d.cpp b/scene/3d/node_3d.cpp
+index 1877331277..092abea483 100644
+--- a/scene/3d/node_3d.cpp
++++ b/scene/3d/node_3d.cpp
+@@ -38,37 +38,37 @@
+ 
+ /*
+ 
+- possible algorithms:
++possible algorithms:
+ 
+- Algorithm 1: (current)
++Algorithm 1: (current)
+ 
+- definition of invalidation: global is invalid
++definition of invalidation: global is invalid
+ 
+- 1) If a node sets a LOCAL, it produces an invalidation of everything above
+- .  a) If above is invalid, don't keep invalidating upwards
+- 2) If a node sets a GLOBAL, it is converted to LOCAL (and forces validation of everything pending below)
++1) If a node sets a LOCAL, it produces an invalidation of everything above
++.  a) If above is invalid, don't keep invalidating upwards
++2) If a node sets a GLOBAL, it is converted to LOCAL (and forces validation of everything pending below)
+ 
+- drawback: setting/reading globals is useful and used very often, and using affine inverses is slow
++drawback: setting/reading globals is useful and used very often, and using affine inverses is slow
+ 
+ ---
+ 
+- Algorithm 2: (no longer current)
++Algorithm 2: (no longer current)
+ 
+- definition of invalidation: NONE dirty, LOCAL dirty, GLOBAL dirty
++definition of invalidation: NONE dirty, LOCAL dirty, GLOBAL dirty
+ 
+- 1) If a node sets a LOCAL, it must climb the tree and set it as GLOBAL dirty
+- .  a) marking GLOBALs as dirty up all the tree must be done always
+- 2) If a node sets a GLOBAL, it marks local as dirty, and that's all?
++1) If a node sets a LOCAL, it must climb the tree and set it as GLOBAL dirty
++.  a) marking GLOBALs as dirty up all the tree must be done always
++2) If a node sets a GLOBAL, it marks local as dirty, and that's all?
+ 
+- //is clearing the dirty state correct in this case?
++//is clearing the dirty state correct in this case?
+ 
+- drawback: setting a local down the tree forces many tree walks often
++drawback: setting a local down the tree forces many tree walks often
+ 
+ --
+ 
+ future: no idea
+ 
+- */
++*/
+ 
+ Node3DGizmo::Node3DGizmo() {
+ }
+@@ -505,6 +505,15 @@ void Node3D::set_scale(const Vector3 &p_scale) {
+ 	}
+ }
+ 
++void Node3D::set_drawing_order(int p_drawing_order) {
++	data.drawing_order = p_drawing_order;
++
++	if (!is_inside_tree()) {
++		return;
++	}
++	_propagate_drawing_order_changed();
++}
++
+ Vector3 Node3D::get_position() const {
+ 	ERR_READ_THREAD_GUARD_V(Vector3());
+ 	return data.local_transform.origin;
+@@ -534,6 +543,15 @@ Vector3 Node3D::get_scale() const {
+ 	return data.scale;
+ }
+ 
++int Node3D::get_drawing_order() const {
++	return data.drawing_order;
++}
++
++int Node3D::get_effective_drawing_order() const {
++	if (data.top_level || !data.parent) return data.drawing_order;
++	return data.parent->get_effective_drawing_order() + data.drawing_order;
++}
++
+ void Node3D::update_gizmos() {
+ 	ERR_THREAD_GUARD;
+ #ifdef TOOLS_ENABLED
+@@ -742,6 +760,25 @@ Ref<World3D> Node3D::get_world_3d() const {
+ 	return data.viewport->find_world_3d();
+ }
+ 
++void Node3D::_propagate_drawing_order_changed() {
++	notification(NOTIFICATION_DRAWING_ORDER_CHANGED);
++	emit_signal(SceneStringNames::get_singleton()->draw_order_changed);
++
++#ifdef TOOLS_ENABLED
++	if (!data.gizmos.is_empty()) {
++		data.gizmos_dirty = true;
++		_update_gizmos();
++	}
++#endif
++
++	for (Node3D *c : data.children) {
++		if (c->data.top_level) {
++			continue; //don't propagate to a top_level
++		}
++		c->_propagate_drawing_order_changed();
++	}
++}
++
+ void Node3D::_propagate_visibility_changed() {
+ 	notification(NOTIFICATION_VISIBILITY_CHANGED);
+ 	emit_signal(SceneStringNames::get_singleton()->visibility_changed);
+@@ -1101,6 +1138,9 @@ void Node3D::_bind_methods() {
+ 	ClassDB::bind_method(D_METHOD("get_rotation_edit_mode"), &Node3D::get_rotation_edit_mode);
+ 	ClassDB::bind_method(D_METHOD("set_scale", "scale"), &Node3D::set_scale);
+ 	ClassDB::bind_method(D_METHOD("get_scale"), &Node3D::get_scale);
++	ClassDB::bind_method(D_METHOD("set_drawing_order", "offset"), &Node3D::set_drawing_order);
++	ClassDB::bind_method(D_METHOD("get_drawing_order"), &Node3D::get_drawing_order);
++	ClassDB::bind_method(D_METHOD("get_effective_drawing_order"), &Node3D::get_drawing_order);
+ 	ClassDB::bind_method(D_METHOD("set_quaternion", "quaternion"), &Node3D::set_quaternion);
+ 	ClassDB::bind_method(D_METHOD("get_quaternion"), &Node3D::get_quaternion);
+ 	ClassDB::bind_method(D_METHOD("set_basis", "basis"), &Node3D::set_basis);
+@@ -1186,6 +1226,7 @@ void Node3D::_bind_methods() {
+ 	ADD_PROPERTY(PropertyInfo(Variant::QUATERNION, "quaternion", PROPERTY_HINT_HIDE_QUATERNION_EDIT, "", PROPERTY_USAGE_EDITOR), "set_quaternion", "get_quaternion");
+ 	ADD_PROPERTY(PropertyInfo(Variant::BASIS, "basis", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_EDITOR), "set_basis", "get_basis");
+ 	ADD_PROPERTY(PropertyInfo(Variant::VECTOR3, "scale", PROPERTY_HINT_LINK, "", PROPERTY_USAGE_EDITOR), "set_scale", "get_scale");
++	ADD_PROPERTY(PropertyInfo(Variant::INT, "drawing_order"), "set_drawing_order", "get_drawing_order");
+ 	ADD_PROPERTY(PropertyInfo(Variant::INT, "rotation_edit_mode", PROPERTY_HINT_ENUM, "Euler,Quaternion,Basis"), "set_rotation_edit_mode", "get_rotation_edit_mode");
+ 	ADD_PROPERTY(PropertyInfo(Variant::INT, "rotation_order", PROPERTY_HINT_ENUM, "XYZ,XZY,YXZ,YZX,ZXY,ZYX"), "set_rotation_order", "get_rotation_order");
+ 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "top_level"), "set_as_top_level", "is_set_as_top_level");
+diff --git a/scene/3d/node_3d.h b/scene/3d/node_3d.h
+index 3b6583174f..dc267b6f94 100644
+--- a/scene/3d/node_3d.h
++++ b/scene/3d/node_3d.h
+@@ -95,6 +95,7 @@ private:
+ 		mutable EulerOrder euler_rotation_order = EulerOrder::YXZ;
+ 		mutable Vector3 euler_rotation;
+ 		mutable Vector3 scale = Vector3(1, 1, 1);
++		mutable int drawing_order = 0;
+ 		mutable RotationEditMode rotation_edit_mode = ROTATION_EDIT_MODE_EULER;
+ 
+ 		mutable MTNumeric<uint32_t> dirty;
+@@ -138,6 +139,7 @@ private:
+ 	void _notify_dirty();
+ 	void _propagate_transform_changed(Node3D *p_origin);
+ 
++	void _propagate_drawing_order_changed();
+ 	void _propagate_visibility_changed();
+ 
+ 	void _propagate_visibility_parent();
+@@ -165,6 +167,7 @@ public:
+ 		NOTIFICATION_EXIT_WORLD = 42,
+ 		NOTIFICATION_VISIBILITY_CHANGED = 43,
+ 		NOTIFICATION_LOCAL_TRANSFORM_CHANGED = 44,
++		NOTIFICATION_DRAWING_ORDER_CHANGED = 45,
+ 	};
+ 
+ 	Node3D *get_parent_node_3d() const;
+@@ -180,6 +183,7 @@ public:
+ 	void set_rotation(const Vector3 &p_euler_rad);
+ 	void set_rotation_degrees(const Vector3 &p_euler_degrees);
+ 	void set_scale(const Vector3 &p_scale);
++	void set_drawing_order(int p_drawing_order);
+ 
+ 	void set_global_position(const Vector3 &p_position);
+ 	void set_global_rotation(const Vector3 &p_euler_rad);
+@@ -191,6 +195,8 @@ public:
+ 	Vector3 get_rotation() const;
+ 	Vector3 get_rotation_degrees() const;
+ 	Vector3 get_scale() const;
++	int get_drawing_order() const;
++	int get_effective_drawing_order() const;
+ 
+ 	Vector3 get_global_position() const;
+ 	Vector3 get_global_rotation() const;
+diff --git a/scene/3d/visual_instance_3d.cpp b/scene/3d/visual_instance_3d.cpp
+index 8026b12c2b..73f2983237 100644
+--- a/scene/3d/visual_instance_3d.cpp
++++ b/scene/3d/visual_instance_3d.cpp
+@@ -53,6 +53,8 @@ void VisualInstance3D::_notification(int p_what) {
+ 			ERR_FAIL_COND(get_world_3d().is_null());
+ 			RenderingServer::get_singleton()->instance_set_scenario(instance, get_world_3d()->get_scenario());
+ 			_update_visibility();
++			int effective_drawing_order = get_effective_drawing_order();
++			RenderingServer::get_singleton()->instance_set_drawing_order(instance, effective_drawing_order);
+ 		} break;
+ 
+ 		case NOTIFICATION_TRANSFORM_CHANGED: {
+@@ -68,6 +70,12 @@ void VisualInstance3D::_notification(int p_what) {
+ 		case NOTIFICATION_VISIBILITY_CHANGED: {
+ 			_update_visibility();
+ 		} break;
++
++		case NOTIFICATION_DRAWING_ORDER_CHANGED: {
++			int effective_drawing_order = get_effective_drawing_order();
++			RenderingServer::get_singleton()->instance_set_drawing_order(instance, effective_drawing_order);
++		} break;
++
+ 	}
+ }
+ 
+diff --git a/scene/scene_string_names.cpp b/scene/scene_string_names.cpp
+index 536ffd1fe4..f2ff3b24e7 100644
+--- a/scene/scene_string_names.cpp
++++ b/scene/scene_string_names.cpp
+@@ -42,6 +42,7 @@ SceneStringNames::SceneStringNames() {
+ 	draw = StaticCString::create("draw");
+ 	_draw = StaticCString::create("_draw");
+ 	hidden = StaticCString::create("hidden");
++	draw_order_changed = StaticCString::create("draw_order_changed");
+ 	visibility_changed = StaticCString::create("visibility_changed");
+ 	input_event = StaticCString::create("input_event");
+ 	shader = StaticCString::create("shader");
+diff --git a/scene/scene_string_names.h b/scene/scene_string_names.h
+index ca8f7a1e7d..45813fe650 100644
+--- a/scene/scene_string_names.h
++++ b/scene/scene_string_names.h
+@@ -59,6 +59,7 @@ public:
+ 	StringName doubledot;
+ 	StringName draw;
+ 	StringName hidden;
++	StringName draw_order_changed;
+ 	StringName visibility_changed;
+ 	StringName input_event;
+ 	StringName _input_event;
+diff --git a/servers/rendering/dummy/rasterizer_scene_dummy.h b/servers/rendering/dummy/rasterizer_scene_dummy.h
+index 965d837ea8..b99d41c0a6 100644
+--- a/servers/rendering/dummy/rasterizer_scene_dummy.h
++++ b/servers/rendering/dummy/rasterizer_scene_dummy.h
+@@ -49,6 +49,7 @@ public:
+ 		virtual void set_surface_materials(const Vector<RID> &p_materials) override {}
+ 		virtual void set_mesh_instance(RID p_mesh_instance) override {}
+ 		virtual void set_transform(const Transform3D &p_transform, const AABB &p_aabb, const AABB &p_transformed_aabb) override {}
++		virtual void set_drawing_order(int p_drawing_order) override {}
+ 		virtual void set_pivot_data(float p_sorting_offset, bool p_use_aabb_center) override {}
+ 		virtual void set_lod_bias(float p_lod_bias) override {}
+ 		virtual void set_layer_mask(uint32_t p_layer_mask) override {}
+diff --git a/servers/rendering/renderer_geometry_instance.cpp b/servers/rendering/renderer_geometry_instance.cpp
+index 4bdd1ea5a4..4cb4b719b9 100644
+--- a/servers/rendering/renderer_geometry_instance.cpp
++++ b/servers/rendering/renderer_geometry_instance.cpp
+@@ -80,6 +80,10 @@ void RenderGeometryInstanceBase::set_transform(const Transform3D &p_transform, c
+ 	lod_model_scale = max_scale;
+ }
+ 
++void RenderGeometryInstanceBase::set_drawing_order(int p_drawing_order) {
++	drawing_order = p_drawing_order;
++}
++
+ void RenderGeometryInstanceBase::set_pivot_data(float p_sorting_offset, bool p_use_aabb_center) {
+ 	sorting_offset = p_sorting_offset;
+ 	use_aabb_center = p_use_aabb_center;
+diff --git a/servers/rendering/renderer_geometry_instance.h b/servers/rendering/renderer_geometry_instance.h
+index e4c8cb375f..322b42da7f 100644
+--- a/servers/rendering/renderer_geometry_instance.h
++++ b/servers/rendering/renderer_geometry_instance.h
+@@ -50,6 +50,7 @@ public:
+ 	virtual void set_surface_materials(const Vector<RID> &p_materials) = 0;
+ 	virtual void set_mesh_instance(RID p_mesh_instance) = 0;
+ 	virtual void set_transform(const Transform3D &p_transform, const AABB &p_aabb, const AABB &p_transformed_aabb) = 0;
++	virtual void set_drawing_order(int p_drawing_order) = 0;
+ 	virtual void set_pivot_data(float p_sorting_offset, bool p_use_aabb_center) = 0;
+ 	virtual void set_lod_bias(float p_lod_bias) = 0;
+ 	virtual void set_layer_mask(uint32_t p_layer_mask) = 0;
+@@ -92,6 +93,7 @@ public:
+ 	bool non_uniform_scale = false;
+ 	float lod_model_scale = 1.0;
+ 	float lod_bias = 0.0;
++	int   drawing_order = 0;
+ 	float sorting_offset = 0.0;
+ 	bool use_aabb_center = true;
+ 
+@@ -136,6 +138,7 @@ public:
+ 	virtual void set_surface_materials(const Vector<RID> &p_materials) override;
+ 	virtual void set_mesh_instance(RID p_mesh_instance) override;
+ 	virtual void set_transform(const Transform3D &p_transform, const AABB &p_aabb, const AABB &p_transformed_aabb) override;
++	virtual void set_drawing_order(int p_drawing_order) override;
+ 	virtual void set_pivot_data(float p_sorting_offset, bool p_use_aabb_center) override;
+ 	virtual void set_lod_bias(float p_lod_bias) override;
+ 	virtual void set_layer_mask(uint32_t p_layer_mask) override;
+diff --git a/servers/rendering/renderer_rd/forward_clustered/render_forward_clustered.h b/servers/rendering/renderer_rd/forward_clustered/render_forward_clustered.h
+index 7ab9e67bac..d9b5cc4abe 100644
+--- a/servers/rendering/renderer_rd/forward_clustered/render_forward_clustered.h
++++ b/servers/rendering/renderer_rd/forward_clustered/render_forward_clustered.h
+@@ -545,7 +545,14 @@ class RenderForwardClustered : public RendererSceneRenderRD {
+ 
+ 		struct SortByReverseDepthAndPriority {
+ 			_FORCE_INLINE_ bool operator()(const GeometryInstanceSurfaceDataCache *A, const GeometryInstanceSurfaceDataCache *B) const {
+-				return (A->sort.priority == B->sort.priority) ? (A->owner->depth > B->owner->depth) : (A->sort.priority < B->sort.priority);
++				return (A->sort.priority == B->sort.priority)
++					?
++						(
++							(A->owner->drawing_order == B->owner->drawing_order)
++							? (A->owner->depth > B->owner->depth)
++							: (A->owner->drawing_order < B->owner->drawing_order)
++						)
++					: (A->sort.priority < B->sort.priority);
+ 			}
+ 		};
+ 
+diff --git a/servers/rendering/renderer_rd/forward_mobile/render_forward_mobile.h b/servers/rendering/renderer_rd/forward_mobile/render_forward_mobile.h
+index 214b39c496..3a74659d8b 100644
+--- a/servers/rendering/renderer_rd/forward_mobile/render_forward_mobile.h
++++ b/servers/rendering/renderer_rd/forward_mobile/render_forward_mobile.h
+@@ -315,7 +315,14 @@ private:
+ 
+ 		struct SortByReverseDepthAndPriority {
+ 			_FORCE_INLINE_ bool operator()(const GeometryInstanceSurfaceDataCache *A, const GeometryInstanceSurfaceDataCache *B) const {
+-				return (A->sort.priority == B->sort.priority) ? (A->owner->depth > B->owner->depth) : (A->sort.priority < B->sort.priority);
++				return (A->sort.priority == B->sort.priority)
++					?
++						(
++							(A->owner->drawing_order == B->owner->drawing_order)
++							? (A->owner->depth > B->owner->depth)
++							: (A->owner->drawing_order < B->owner->drawing_order)
++						)
++					: (A->sort.priority < B->sort.priority);
+ 			}
+ 		};
+ 
+diff --git a/servers/rendering/renderer_scene_cull.cpp b/servers/rendering/renderer_scene_cull.cpp
+index c5eabba326..e9e8c4a045 100644
+--- a/servers/rendering/renderer_scene_cull.cpp
++++ b/servers/rendering/renderer_scene_cull.cpp
+@@ -646,6 +646,7 @@ void RendererSceneCull::instance_set_base(RID p_instance, RID p_base) {
+ 				geom->geometry_instance->set_surface_materials(instance->materials);
+ 				geom->geometry_instance->set_transform(instance->transform, instance->aabb, instance->transformed_aabb);
+ 				geom->geometry_instance->set_layer_mask(instance->layer_mask);
++				geom->geometry_instance->set_drawing_order(instance->drawing_order);
+ 				geom->geometry_instance->set_pivot_data(instance->sorting_offset, instance->use_aabb_center);
+ 				geom->geometry_instance->set_lod_bias(instance->lod_bias);
+ 				geom->geometry_instance->set_transparency(instance->transparency);
+@@ -862,6 +863,19 @@ void RendererSceneCull::instance_set_layer_mask(RID p_instance, uint32_t p_mask)
+ 	}
+ }
+ 
++void RendererSceneCull::instance_set_drawing_order(RID p_instance, int p_drawing_order) {
++	Instance *instance = instance_owner.get_or_null(p_instance);
++	ERR_FAIL_COND(!instance);
++
++	instance->drawing_order  = p_drawing_order;
++
++	if ((1 << instance->base_type) & RS::INSTANCE_GEOMETRY_MASK && instance->base_data) {
++		InstanceGeometryData *geom = static_cast<InstanceGeometryData *>(instance->base_data);
++		ERR_FAIL_NULL(geom->geometry_instance);
++		geom->geometry_instance->set_drawing_order(p_drawing_order);
++	}
++}
++
+ void RendererSceneCull::instance_set_pivot_data(RID p_instance, float p_sorting_offset, bool p_use_aabb_center) {
+ 	Instance *instance = instance_owner.get_or_null(p_instance);
+ 	ERR_FAIL_COND(!instance);
+diff --git a/servers/rendering/renderer_scene_cull.h b/servers/rendering/renderer_scene_cull.h
+index 4745c3d1d3..7c25b6c56d 100644
+--- a/servers/rendering/renderer_scene_cull.h
++++ b/servers/rendering/renderer_scene_cull.h
+@@ -461,6 +461,7 @@ public:
+ 		ObjectID object_id;
+ 
+ 		// sorting
++		int drawing_order = 0;
+ 		float sorting_offset = 0.0;
+ 		bool use_aabb_center = true;
+ 
+@@ -960,6 +961,7 @@ public:
+ 	virtual void instance_set_base(RID p_instance, RID p_base);
+ 	virtual void instance_set_scenario(RID p_instance, RID p_scenario);
+ 	virtual void instance_set_layer_mask(RID p_instance, uint32_t p_mask);
++	virtual void instance_set_drawing_order(RID p_instance, int p_drawing_order);
+ 	virtual void instance_set_pivot_data(RID p_instance, float p_sorting_offset, bool p_use_aabb_center);
+ 	virtual void instance_set_transform(RID p_instance, const Transform3D &p_transform);
+ 	virtual void instance_attach_object_instance_id(RID p_instance, ObjectID p_id);
+diff --git a/servers/rendering/rendering_method.h b/servers/rendering/rendering_method.h
+index f705603a1c..917c4eff94 100644
+--- a/servers/rendering/rendering_method.h
++++ b/servers/rendering/rendering_method.h
+@@ -72,6 +72,7 @@ public:
+ 	virtual void instance_set_base(RID p_instance, RID p_base) = 0;
+ 	virtual void instance_set_scenario(RID p_instance, RID p_scenario) = 0;
+ 	virtual void instance_set_layer_mask(RID p_instance, uint32_t p_mask) = 0;
++	virtual void instance_set_drawing_order(RID p_instance, int p_drawing_order) = 0;
+ 	virtual void instance_set_pivot_data(RID p_instance, float p_sorting_offset, bool p_use_aabb_center) = 0;
+ 	virtual void instance_set_transform(RID p_instance, const Transform3D &p_transform) = 0;
+ 	virtual void instance_attach_object_instance_id(RID p_instance, ObjectID p_id) = 0;
+diff --git a/servers/rendering/rendering_server_default.h b/servers/rendering/rendering_server_default.h
+index 797fe73ba0..9e0d2129aa 100644
+--- a/servers/rendering/rendering_server_default.h
++++ b/servers/rendering/rendering_server_default.h
+@@ -765,6 +765,7 @@ public:
+ 	FUNC2(instance_set_base, RID, RID)
+ 	FUNC2(instance_set_scenario, RID, RID)
+ 	FUNC2(instance_set_layer_mask, RID, uint32_t)
++	FUNC2(instance_set_drawing_order, RID, int)
+ 	FUNC3(instance_set_pivot_data, RID, float, bool)
+ 	FUNC2(instance_set_transform, RID, const Transform3D &)
+ 	FUNC2(instance_attach_object_instance_id, RID, ObjectID)
+diff --git a/servers/rendering_server.cpp b/servers/rendering_server.cpp
+index 0c5c263265..8e5f9ced18 100644
+--- a/servers/rendering_server.cpp
++++ b/servers/rendering_server.cpp
+@@ -2492,6 +2492,7 @@ void RenderingServer::_bind_methods() {
+ 	ClassDB::bind_method(D_METHOD("instance_set_base", "instance", "base"), &RenderingServer::instance_set_base);
+ 	ClassDB::bind_method(D_METHOD("instance_set_scenario", "instance", "scenario"), &RenderingServer::instance_set_scenario);
+ 	ClassDB::bind_method(D_METHOD("instance_set_layer_mask", "instance", "mask"), &RenderingServer::instance_set_layer_mask);
++	ClassDB::bind_method(D_METHOD("instance_set_drawing_order", "instance", "drawing_order"), &RenderingServer::instance_set_drawing_order);
+ 	ClassDB::bind_method(D_METHOD("instance_set_pivot_data", "instance", "sorting_offset", "use_aabb_center"), &RenderingServer::instance_set_pivot_data);
+ 	ClassDB::bind_method(D_METHOD("instance_set_transform", "instance", "transform"), &RenderingServer::instance_set_transform);
+ 	ClassDB::bind_method(D_METHOD("instance_attach_object_instance_id", "instance", "id"), &RenderingServer::instance_attach_object_instance_id);
+diff --git a/servers/rendering_server.h b/servers/rendering_server.h
+index deac2a59f9..0f2bd9303b 100644
+--- a/servers/rendering_server.h
++++ b/servers/rendering_server.h
+@@ -1220,6 +1220,7 @@ public:
+ 	virtual void instance_set_base(RID p_instance, RID p_base) = 0;
+ 	virtual void instance_set_scenario(RID p_instance, RID p_scenario) = 0;
+ 	virtual void instance_set_layer_mask(RID p_instance, uint32_t p_mask) = 0;
++	virtual void instance_set_drawing_order(RID p_instance, int p_drawing_order) = 0;
+ 	virtual void instance_set_pivot_data(RID p_instance, float p_sorting_offset, bool p_use_aabb_center) = 0;
+ 	virtual void instance_set_transform(RID p_instance, const Transform3D &p_transform) = 0;
+ 	virtual void instance_attach_object_instance_id(RID p_instance, ObjectID p_id) = 0;
+-- 
+2.39.2 (Apple Git-143)
+

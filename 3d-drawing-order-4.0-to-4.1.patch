@@ -1,0 +1,25 @@
+From 3080882e7c42e28a8b8d0291a5ddb87c6c3735e6 Mon Sep 17 00:00:00 2001
+From: Brom Bresenham <brom.bresenham@runegate.com>
+Date: Sun, 2 Jul 2023 22:19:43 -0400
+Subject: [3D Drawing Order] Small fix for Godot 4.1
+
+---
+ scene/3d/node_3d.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/scene/3d/node_3d.cpp b/scene/3d/node_3d.cpp
+index 8c1653d791..092abea483 100644
+--- a/scene/3d/node_3d.cpp
++++ b/scene/3d/node_3d.cpp
+@@ -772,7 +772,7 @@ void Node3D::_propagate_drawing_order_changed() {
+ #endif
+ 
+ 	for (Node3D *c : data.children) {
+-		if (c->data.top_level_active) {
++		if (c->data.top_level) {
+ 			continue; //don't propagate to a top_level
+ 		}
+ 		c->_propagate_drawing_order_changed();
+-- 
+2.39.2 (Apple Git-143)
+
